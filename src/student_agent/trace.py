@@ -13,8 +13,10 @@ class TraceWriter:
     """Append observable workflow events. Never put prompts or chain-of-thought here."""
 
     def __init__(self, path: Path, contracts: Contracts) -> None:
+        import threading
         self.path = path
         self.contracts = contracts
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(
@@ -46,6 +48,7 @@ class TraceWriter:
         }
         event.update({key: value for key, value in optional.items() if value is not None})
         self.contracts.validate_trace(event, "trace event")
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
         return event

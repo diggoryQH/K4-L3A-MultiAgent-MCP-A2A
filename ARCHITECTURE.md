@@ -4,50 +4,66 @@ Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả
 
 ## 1. System overview
 
-Vẽ hoặc mô tả luồng từ `inputs/<case_id>.json` đến MCP calls, specialist agents, verifier, output và trace.
+Luồng xử lý từ input đến output qua các Specialist Agents, được điều phối bởi Coordinator.
 
 ```text
-Input → Coordinator → Specialists → Verifier → Output
-                         │              │
-                         └── MCP ───────┴── Trace
+Input (case.json) → Coordinator → Order Agent
+                                  Payment Agent
+                                  Shipment Agent
+                                  Policy Agent
+                                        │
+                                        ▼
+                                     Verifier
+                                        │
+                                        ▼
+                                Output (outputs/<case_id>.json)
+                                        │
+MCP Evidence Gateway ───────────────────┴── Trace (traces/trace.jsonl)
 ```
 
 ## 2. Agent ownership
 
-| Actor | Input | Trách nhiệm | Output/handoff |
-| --- | --- | --- | --- |
-| Coordinator | TODO | TODO | TODO |
-| Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
-| Shipment | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO |
-
-Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
+| Actor | Input | Trách nhiệm | Output/handoff | Tool được phép gọi |
+| --- | --- | --- | --- | --- |
+| Coordinator | `case_id`, nội dung khiếu nại | Phân tích yêu cầu, phân phối công việc cho các agent, tổng hợp dữ liệu. Emit `case_received`, `task_assigned`, `case_finalized`. | Handoff công việc tới Specialist, handoff dữ liệu tới Verifier. | Không |
+| Order/Item Agent | `case_id`, `order_id` | Lấy chi tiết đơn hàng, mặt hàng, người bán. Xác định `affected_entities` (order, item, seller). | Trạng thái đơn hàng, ID liên quan, `evidence_refs`. Handoff về Coordinator. | `get_order`, `get_order_items`, `get_sellers`, `get_product_context` |
+| Payment Agent | `case_id`, `order_id`, `payment_ref` | Đối chiếu thanh toán, hoàn tiền. Tính `financial_resolution`. | Chi tiết thanh toán, `evidence_refs`. Handoff về Coordinator. | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` |
+| Shipment Agent | `case_id`, `order_id` | Kiểm tra giao hàng, trễ hạn. Xác định nguyên nhân (seller vs logistics). | Trạng thái giao hàng, lỗi của ai, `evidence_refs`. Handoff về Coordinator. | `get_shipment_summary` |
+| Policy Agent | Bối cảnh khiếu nại | Đối chiếu chính sách của nền tảng xem claim có hợp lệ không. | `resolution_actions`, `evidence_refs`. Handoff về Coordinator. | `get_policy` |
+| Verifier | Dữ liệu tổng hợp | Rà soát `consistency`, tính `confidence`, sinh output đúng JSON schema. Đảm bảo toàn vẹn evidence. | Output JSON. Handoff lưu file. | Không |
 
 ## 3. A2A protocol
 
-Mô tả message envelope, correlation theo `case_id`, điều kiện handoff, timeout và cách tránh vòng lặp. Chỉ trace sự kiện/decision code quan sát được; không trace nội dung suy luận riêng.
+- **Message envelope**: Dùng `case_id` làm khóa tương quan (correlation id) trong toàn bộ payload trao đổi.
+- **Handoff**: Các Specialist trả về một dictionary chuẩn hóa chứa `data` và mảng `evidence_refs`.
+- **Trace**: Chỉ emit trace ở các mốc quan trọng (nhận case, giao task, tiêu thụ tool result, kiểm tra xong, hoàn thành case). Không trace các bước suy luận nội bộ.
 
 ## 4. Evidence lifecycle
 
-Mô tả cách validate MCP response, lưu `evidence_ref`, map evidence vào claim/output và emit `tool_result_consumed`. Evidence không được tái sử dụng giữa các case.
+- **Validation**: Mọi MCP response được lưu trữ và bóc tách `evidence_ref`.
+- **Consumption**: Ngay khi dùng dữ liệu từ MCP để đưa ra kết luận, agent sẽ gọi `trace.emit(event_type="tool_result_consumed", evidence_refs=[...])`.
+- **Output linkage**: Toàn bộ `evidence_refs` hợp lệ sẽ được map thẳng vào `claim_assessments` và mảng `evidence_refs` của output schema. Cấm tái sử dụng evidence giữa các case.
 
 ## 5. Failure policy
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
-| MCP timeout | TODO | TODO | TODO |
-| Not found | TODO | TODO | TODO |
-| Source conflict | TODO | TODO | TODO |
-| Invalid specialist result | TODO | TODO | TODO |
-
-Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
+| MCP timeout | Có (tối đa 3 lần) | Chờ exponential backoff. Nếu vẫn fail, ngưng case. | Không emit trace nếu rỗng. |
+| Not found | Không | Ghi nhận entity không tồn tại, claim `unsupported`. | `tool_result_consumed` với evidence_ref (nếu API có trả về empty evidence). |
+| Source conflict | Không | Ưu tiên dữ liệu hệ thống (MCP) hơn claim khách hàng. | Ghi nhận vào field `data_conflicts`. |
+| Invalid specialist result | Không | Verifier bắt lỗi và reject logic, ghi log. | `verification_completed` với confidence thấp. |
 
 ## 6. Verification invariants
 
-Liệt kê kiểm tra trước finalize: schema, entity scope, evidence ownership, claim linkage, money totals, responsibility/action consistency và confidence bounds.
+Trước khi xuất file JSON, Verifier sẽ kiểm tra:
+1.  **Schema**: Đáp ứng 100% `day09-l3a-output-v2.schema.json`.
+2.  **Entity scope**: Mọi ID trong `affected_entities` phải xuất phát từ MCP.
+3.  **Claim linkage**: Các claim phải map 1-1 với `case.json` input.
+4.  **Money totals**: `recommended_refund_brl` phải bằng tổng `amount_brl` của `refund_lines`.
+5.  **Evidence ownership**: Không có `evidence_ref` nào tự bịa (hallucinated) hoặc sai format `ev_...`.
 
 ## 7. Reproducibility
 
-Ghi model/config, dependency pinning, concurrency limit, random seed (nếu có), lệnh chạy và các giới hạn tài nguyên. Không ghi API key.
+- Lệnh chạy: `day09 run`
+- Môi trường: Python 3.12.2, cài đặt qua `pip install -e ".[dev]"`.
+- Không sử dụng token bí mật ngoài `COMPETITION_TEAM_API_KEY` (được cách ly trong `.env`).
